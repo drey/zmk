@@ -36,10 +36,10 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #include <zmk/split/bluetooth/uuid.h>
 #include <zmk/event_manager.h>
 #include <zmk/events/ble_active_profile_changed.h>
-
-#if IS_ENABLED(CONFIG_ZMK_BLE_PASSKEY_ENTRY)
+#include <zmk/events/position_state_changed.h>
 #include <zmk/events/keycode_state_changed.h>
 
+#if IS_ENABLED(CONFIG_ZMK_BLE_PASSKEY_ENTRY)
 #define PASSKEY_DIGITS 6
 
 static struct bt_conn *auth_passkey_entry_conn;
@@ -61,6 +61,7 @@ enum advertising_type {
 
 static struct zmk_ble_profile profiles[ZMK_BLE_PROFILE_COUNT];
 static uint8_t active_profile;
+static bool host_suspended;
 
 #define DEVICE_NAME CONFIG_BT_DEVICE_NAME
 #define DEVICE_NAME_LEN (sizeof(DEVICE_NAME) - 1)
@@ -182,7 +183,7 @@ int update_advertising(void) {
 
     if (zmk_ble_active_profile_is_open()) {
         desired_adv = ZMK_ADV_CONN;
-    } else if (!zmk_ble_active_profile_is_connected()) {
+    } else if (!zmk_ble_active_profile_is_connected() && !host_suspended) {
         desired_adv = ZMK_ADV_CONN;
         // Need to fix directed advertising for privacy centrals. See
         // https://github.com/zephyrproject-rtos/zephyr/pull/14984 char
@@ -295,6 +296,7 @@ int zmk_ble_prof_select(uint8_t index) {
     }
 
     active_profile = index;
+    host_suspended = false;
     ble_save_profile();
 
     update_advertising();
@@ -511,6 +513,7 @@ static void connected(struct bt_conn *conn, uint8_t err) {
 
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
     advertising_status = ZMK_ADV_NONE;
+    host_suspended = false;
 
     if (err) {
         LOG_WRN("Failed to connect to %s (%u)", addr, err);
@@ -541,6 +544,13 @@ static void disconnected(struct bt_conn *conn, uint8_t reason) {
     if (info.role != BT_CONN_ROLE_PERIPHERAL) {
         LOG_DBG("SKIPPING FOR ROLE %d", info.role);
         return;
+    }
+
+    // A suspending host wakes up again on any advertisement from a bonded HID device, so
+    // re-advertising right away would wake it immediately. Stay silent until the next key event.
+    if (reason == BT_HCI_ERR_REMOTE_POWER_OFF && is_conn_active_profile(conn)) {
+        LOG_DBG("Host is suspending, holding advertising until the next key event");
+        host_suspended = true;
     }
 
     // We need to do this in a work callback, otherwise the advertising update will still see the
@@ -830,5 +840,29 @@ static int zmk_ble_listener(const zmk_event_t *eh) {
 ZMK_LISTENER(zmk_ble, zmk_ble_listener);
 ZMK_SUBSCRIPTION(zmk_ble, zmk_keycode_state_changed);
 #endif /* IS_ENABLED(CONFIG_ZMK_BLE_PASSKEY_ENTRY) */
+
+// Completed combos swallow their position events before this listener runs, so keycode events
+// are watched as well.
+static int zmk_ble_host_wake_listener(const zmk_event_t *eh) {
+    if (!host_suspended) {
+        return ZMK_EV_EVENT_BUBBLE;
+    }
+
+    struct zmk_position_state_changed *pos_ev = as_zmk_position_state_changed(eh);
+    struct zmk_keycode_state_changed *kc_ev = as_zmk_keycode_state_changed(eh);
+    bool pressed = (pos_ev != NULL && pos_ev->state) || (kc_ev != NULL && kc_ev->state);
+
+    if (pressed) {
+        LOG_DBG("Key press after host suspend, resuming advertising");
+        host_suspended = false;
+        k_work_submit(&update_advertising_work);
+    }
+
+    return ZMK_EV_EVENT_BUBBLE;
+}
+
+ZMK_LISTENER(zmk_ble_host_wake, zmk_ble_host_wake_listener);
+ZMK_SUBSCRIPTION(zmk_ble_host_wake, zmk_position_state_changed);
+ZMK_SUBSCRIPTION(zmk_ble_host_wake, zmk_keycode_state_changed);
 
 SYS_INIT(zmk_ble_init, APPLICATION, CONFIG_ZMK_BLE_INIT_PRIORITY);
